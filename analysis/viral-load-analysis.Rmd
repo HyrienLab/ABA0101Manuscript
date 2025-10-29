@@ -1,0 +1,510 @@
+---
+title: "ABA-0101: Antiviral activity of 10E8.4/iMab"
+author: "Bryan Mayer"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    keep_tex: true
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(rprojroot)
+library(conflicted)
+library(patchwork)
+library(glue)
+library(knitr)
+
+source(find_rstudio_root_file("R/config-setup.R"))
+source(find_rstudio_root_file("R/output-funs.R"))
+
+# knitr options
+opts_chunk$set(cache = FALSE, message = FALSE, warning = FALSE, echo = FALSE, 
+               dev = c("png", "pdf"), dpi = 200, out.width = "100%", 
+               out.extra = "", fig.align = "center", fig.pos = "H")
+
+# NA's will be blank in tables
+options(knitr.kable.NA = '')
+
+# Create a theme 
+visc_theme <- theme_classic() + 
+  theme(
+    legend.position = "bottom", 
+    legend.margin = margin(unit = "cm"),
+    panel.grid.minor = element_blank()
+    )
+
+theme_set(visc_theme)
+
+conflict_prefer("filter", "dplyr")
+output_type = get_output_type()
+
+```
+
+
+```{r word-pdf-options}
+kable_warnings <- T
+```
+
+```{r load-raw-data}
+elisa_data_all = read_csv(find_rstudio_root_file("data/ABA0101-ELISA.csv"),
+                          show_col_types = F)
+cd4ro_data_all = read_csv(find_rstudio_root_file("data/ABA0101-cd4ro.csv"),
+                          show_col_types = F)
+
+# Group variables for merging 
+group_variables <- elisa_data_all %>% 
+  mutate(group_label = glue("Group {group}: {dose} {dose_units} {route}")) %>% 
+  distinct(pubid, group, group_label, dose, dose_units, weight, weight_unit) %>% 
+  mutate(dose_amount = dose*weight)
+
+```
+
+```{r elisa-data-processing}
+
+elisa_data = elisa_data_all %>%
+  filter(
+    analyte != "Placebo", 
+    !is.na(concentration)
+    ) %>%
+  mutate(
+    # VDC removal (April 2022)
+    concentration = if_else(pubid == "1450" & visitno == "8", 200, concentration),
+    hiv_status = if_else(arm == "3", "pos", "neg"),
+    concentration_ug = concentration/1000,
+    group_label = glue("{group}: {dose} {dose_units}")) 
+  
+elisa_summary = elisa_data %>% 
+  group_by(route, study_day, group_label,hiv_status) %>% 
+  summarise(
+    outcome = "conc",
+    n = n(),
+    mean = mean(concentration_ug),
+    se = sqrt(var(concentration_ug)/length(concentration_ug)),
+    lower = mean - se,
+    upper = mean + se,
+    .groups = "drop"
+  ) %>%
+  left_join(route_label, by = "route")
+```
+
+```{r cd4ro-data-processing}
+
+cd4ro_data <-cd4ro_data_all %>% 
+  mutate(hiv_status = if_else(hiv_status == "positive", "pos", hiv_status)) %>%
+  filter(
+    analyte != "Placebo", 
+    !is.na(cd4ro)
+    ) %>%
+  mutate(
+    group_label = glue("{group}: {dose} {dose_units}"),
+    # truncate cd4ro data between 0 and 100
+    cd4ro_trunc = pmin(pmax(cd4ro, 0), 100)
+    ) %>%
+  left_join(route_label, by = "route")
+
+cd4ro_summary = cd4ro_data %>% 
+  group_by(route, study_day, group_label, hiv_status) %>% 
+  summarise(
+    outcome = "cd4ro",
+    n = n(),
+    mean = mean(cd4ro_trunc),
+    se = sqrt(var(cd4ro_trunc)/length(cd4ro_trunc)),
+    lower = mean - se,
+    upper = mean + se,
+    .groups = "drop"
+  ) %>%
+  left_join(route_label, by = "route")
+
+mean_summary_data = bind_rows(elisa_summary, cd4ro_summary)
+```
+
+```{r vl-functions}
+
+
+#' Calc V(t) based on cART model
+#' See Perelson et al, Nature 1997 (primary source), Perelson Science 1996, Markowitz JVI 2003, Palmer PNAS 2008
+#' And Methods in HIV+ PT report
+#'
+#' @param t time
+#' @param v0  viral load at time of decay start (post-lag)
+#' @param NkT0 mass-action constant
+#' @param uM death rate long-lasting infected cells
+#' @param delta death rate infected cells (~1/day)
+#' @param c death rate free virus (~23/day)
+#'
+#' @return vector of length t
+calc_vl_model = function(t, v0, NkT0, uM, delta, c = 23){
+  A = NkT0/(c - delta)
+  C = (c - NkT0)/(c - uM)
+
+  out = v0*(A * exp(-delta*t) + C * exp(-uM*t)) + v0*((1-A-C) * exp(-c*t))
+  pmax(out, 1e-8)
+}
+
+
+#' Calc V(t) based on biexponential model (PK::biexp)
+#'
+#' @param t time
+#' @param biexp_parms  data.frame (list?) with values for A, delta, B, uM
+#' @return vector of length t
+calc_vl_bixep = function(t, biexp_parms){
+  biexp_parms$A*exp(-biexp_parms$delta*t) + biexp_parms$B*exp(-biexp_parms$uM*t)
+}
+
+#' predicts viral load with given parameters
+#' Should probably be a .function
+#' Time is fixed 2:14,
+#'
+#' @param model_type "biexp" or other
+#' @param parms calls calc_vl_bixep ("biexp") calc_vl_model, see those functions for parm requirements
+#' @param v0 viral load at day 2
+#'
+#' @return tibble with day, conc (predicted)
+predict_model_vl = function(model_type, parms, v0){
+
+  if(model_type == "second_phase") return(NULL)
+
+  if(model_type == "biexp") return(
+    tibble(day = 2:14,
+           conc = calc_vl_bixep(day-2, biexp_parms = parms)
+            )
+    )
+
+  tibble(day = 2:14,
+         conc = log10(calc_vl_model(day-2, v0 = v0,
+                              NkT0 = parms$NkT0,
+                              uM = parms$uM,
+                              delta = parms$delta))
+  )
+
+}
+
+#' Wrapper to fit VL models to Group H participants (mod_data)
+#' Calls functions above
+#' Due to issue with free nls biexp model, it was removed but left as legacy in code
+#'
+#' @param mod_data data.frame with log10vl, day (starting at day 2)
+#'
+#' @return nested tibble (see code for details)
+fit_vl_models = function(mod_data){
+  v0_in = max(mod_data$log10vl)
+  conc = mod_data$log10vl
+  time = mod_data$day - 2
+
+  biexp.res = PK::biexp(conc=conc, time=time, log.scale=T)
+  parms.obs <- list(A=biexp.res$parms[3,1], delta=biexp.res$parms[2,1],
+                    B=biexp.res$parms[3,2], uM=biexp.res$parms[2,2])
+  delta = parms.obs[['delta']]
+  uM =  parms.obs[['uM']]
+  B = parms.obs[['B']]
+  x = nls(conc ~ A*exp(-delta*time) + B*exp(-uM*time), start=parms.obs[1],
+          control=nls.control(tol=Inf))
+  rss = deviance(x)
+
+  #res.nls = nls(conc ~ log10(calc_vl_model(t = time, v0 = 10^v0_in,
+  #                                         uM = uM, NkT0 = NkT0, delta = delta)),
+  #              start=list(uM = 0.07, delta = 1, NkT0 = 15))
+
+  res.nls.fixed = nls(conc ~ log10(calc_vl_model(t = time, v0 = 10^v0_in,
+                                                 uM = log(2)/25, delta = log(2)/1,
+                                                 NkT0 = NkT0)),
+                      start=list(NkT0 = 10), control = list(maxiter = 1000),
+                      algorithm = "plinear")
+
+
+  second_phase_data = filter(mod_data, day > 7 & day < 20)
+  second_phase_lm = lm(log10vl ~ day, data = second_phase_data)
+  second_phase_parms = as_tibble(coef(second_phase_lm), rownames = "parms") %>%
+    spread(parms, value) %>%
+    mutate(uM = -log(10^(day)), delta = Inf)
+
+  tibble(
+    model_type = c("biexp",
+                   #"nls_fit",
+                   "nls_fix",
+                   "second_phase"),
+    model_obj = list(biexp.res,
+                     #res.nls,
+                     res.nls.fixed,
+                     second_phase_lm),
+    model_parms = list(bind_rows(parms.obs),
+                       #bind_rows(coef(res.nls)),
+                       mutate(bind_rows(coef(res.nls.fixed)), uM = log(2)/25, delta = log(2)/1),
+                       second_phase_parms),
+    model_rss = c(rss, deviance(res.nls.fixed), NA_real_),
+    predict = map2(model_type, model_parms, predict_model_vl, v0 = 10^v0_in),
+    half_lives = map(model_parms,
+                     ~tibble(hl1 = log(2)/..1$delta, hl2 = log(2)/..1$uM))
+  ) %>%
+    unnest(cols = half_lives)
+
+}
+
+```
+
+```{r viral-load-analysis}
+
+viral_load_data = elisa_data %>%
+  filter(!is.na(viral_load_count) & day > 0) %>%
+  group_by(pubid) %>%
+  mutate(
+    min_vl = min(viral_load_count[day < 50]),
+    max_vl =  max(viral_load_count[day < 20]),
+    min_vl_day = day[viral_load_count == min_vl],
+    max_vl_day = day[viral_load_count == max_vl]
+    )
+
+mod_res = viral_load_data %>%
+  filter(day <= min_vl_day & day >= 2) %>%
+  mutate(log10vl = log10(viral_load_count)) %>%
+  group_by(pubid) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(
+    res = map(data, fit_vl_models)
+  ) %>%
+  unnest(cols = res) %>%
+  filter(model_type == "nls_fix")
+
+# baseline, nadir, nadir day, total drop, rebound time, V0, K, max half-life
+# max slope from looking at data, it's between day 2 and 7
+vl_summary = viral_load_data %>%
+  filter(day < 30) %>%
+  mutate(
+    log10vl = log10(viral_load_count),
+    logvl = log(viral_load_count) # for half-live
+    ) %>%
+  group_by(pubid) %>%
+  arrange(day) %>%
+  summarize(
+    baseline_vl = log10vl[which.min(day)],
+    nadir_vl = min(log10vl),
+    nadir_vl_ln = min(logvl),
+    nadir_day = day[log10vl == nadir_vl],
+    log10_fold_reduction = baseline_vl - nadir_vl,
+    rebound_day =  min(day[day > nadir_day]),
+    rebound_vl = log10vl[day == rebound_day],
+    V0 = log10vl[day == 2], # this was fixed in modeling
+    V0_ln = logvl[day == 2], 
+    V0_day7_ln = logvl[day == 7], 
+    min_rate = (V0_ln - V0_day7_ln)/(2 - 7),
+    max_hl = -log(2)/(min_rate),
+    .groups = "drop"
+  ) %>%
+  left_join(select(unnest(mod_res, cols = model_parms), pubid, K = NkT0), by = "pubid")
+
+```
+
+# Overview
+
+This analysis script performs the viral load summary analysis and assesses antiviral activity of 10E8.4/iMab in Group H participants (10 mg/kg IV: PWH).
+
+# Manuscript Tables
+
+## Ext. Table 1: VL modeling
+
+```{r vl-summary}
+
+caption = "Summary of viral load (VL) results for each participant (with median) in Group H (10 mg/kg). Nadir VL was measured at day 14 for all participants. Log$_{10}$-reduction in VL was calculated between baseline and nadir. Maximum (slowest) half-life was calculated assuming a linear reduction between VL measurements on days 2 and 7 for comparison to combination antiretroviral treatment (cART) first-phase half-life of 0.67 days. Rebound time (range) is interval censored between nadir day and the following observation time point. For more details on model parameters ($V_0$ and $K$). Viral load measurements are log$_{10}$ concentration (copies/mL)."
+
+vl_summary %>%
+  mutate(rebound_range = paste(nadir_day, rebound_day, sep = ", ")) %>%
+  select(`Pub-ID` = pubid, pubid, `Baseline VL` = baseline_vl, 
+         `Nadir VL` = nadir_vl, `Log$_{10}$-reduction VL` = log10_fold_reduction,
+         `Max initial HL (days)` = max_hl,
+         `Rebound day (range)` = rebound_range, `Rebound VL` = rebound_vl, 
+         `Model $V_0$` = V0, `Model parameter $K$` = K) %>%
+  bind_rows(summarise(.,
+                      across(where(is.numeric), median),
+                      across(where(is.character), ~"Median"),
+                      across(contains("range"), ~""))) %>%
+  kable(
+    digits = 2,
+    format = output_type,
+    caption = caption,
+    escape = FALSE,
+    booktabs = TRUE,
+    align = "lrrr",
+    caption.short = "Viral load summary."
+  ) %>% 
+   kable_styling(latex_options = c("scale_down", "hold_position")) %>%
+  row_spec(3, hline_after = T)
+
+```
+
+`r insert_break()`
+
+# Manuscript Figures
+
+## Figure 3: PWH PK Analysis
+
+### Figure 3A/3B: See PKPD analysis 
+
+### Figure 3C: Viral load vs. PKPD
+
+```{r obs-vl, fig.cap = "PK Data vs. viral load"}
+
+# rescales concentration to vl range using a proportion factor
+vl_scale = 500
+
+conc_vl_pl = viral_load_data %>%
+  ggplot(aes(x = day, y = viral_load_count)) +
+  geom_point(colour = "red") +
+  geom_line(colour = "red") +
+  facet_wrap( ~ pubid) +
+  scale_y_log10(
+    breaks = 10 ^ (2:6),
+    labels = 2:6,
+    sec.axis = sec_axis(
+      ~ . / vl_scale,
+      name = conc_title,
+      breaks = c(.2, 1, 10, 100, 1000),
+      labels = c(expression("" <= .2), '1', '10', '100', '1,000')
+    ),
+  ) +
+  geom_point(
+    data = filter(elisa_data, group == "H"),
+    aes(y = vl_scale * concentration_ug),
+    alpha = 0.5
+  ) +
+  geom_line(
+    data = filter(elisa_data, group == "H"),
+    aes(y = vl_scale * concentration_ug),
+    alpha = 0.5
+  ) + 
+  labs(colour = "",
+       x = "Days post-administration",
+       y = vl_title
+  ) +
+  theme(legend.position = "top", strip.text = element_text(size = 8),
+        axis.title.y.left = element_text(color="red"), 
+        axis.title.y.right = element_text(size = 10),
+        axis.text.y.left = element_text(color="red"))
+  
+# these functions are used to re-scale CD4RO range (logistic) to viral load range for left-axis
+logitic_inv <- function(p) (1-p)/p
+rescale_logistic = function(p, l = 2, u = 6.5) u + (l - u)/(1+logitic_inv(p)^(-1))
+descale_logistic = function(x, l0 = 2, u0 = 6.5, l = 0, u = 1) {
+  old_stat = (u0 - x)/(x - l0) 
+  u + (l - u)/(1+old_stat^(-1))
+}
+
+cd4ro_vl_pl =  viral_load_data %>%
+  ggplot(aes(x = day, y = log10(viral_load_count))) +
+  geom_point(colour = "red") +
+  geom_line(colour = "red") +
+  facet_wrap( ~ pubid) +
+  scale_y_continuous(
+    sec.axis = sec_axis(
+      ~ descale_logistic(.)*100 ,
+      name = "% CD4RO"
+    )
+  ) +
+  geom_point(
+    data = filter(cd4ro_data, group == "H"),
+    aes(y = rescale_logistic(cd4ro_trunc/100)),
+    alpha = 0.5
+  ) +
+  geom_line(
+    data = filter(cd4ro_data, group == "H"),
+    aes(y = rescale_logistic(cd4ro_trunc/100)),
+    alpha = 0.5,
+    linetype = "dashed"
+  ) + 
+  labs(colour = "",
+       x = "Days post-administration",
+       y = vl_title
+  ) +
+  theme(legend.position = "top", strip.text = element_text(size = 8),
+        axis.title.y.left = element_text(color="red"), 
+        axis.text.y.left = element_text(color="red"))
+
+conc_vl_pl/cd4ro_vl_pl + plot_layout(axis_titles = "collect")
+
+```
+
+### Figure 3D: Viral load clearance modeling
+
+```{r vl-pred, fig.cap = "Viral load model"}
+
+vl_pl_data = viral_load_data %>%
+  filter(day <= 22) %>%
+  mutate(log10vl = log10(viral_load_count))
+
+mod_res %>%
+  unnest(cols = predict) %>%
+  ggplot(aes(x = day, y = conc)) +
+  geom_point(data = subset(vl_pl_data, day >= 2 & day <= 20), aes(y = log10vl), color = "red") +
+  geom_point(data = subset(vl_pl_data, day < 2 | day > 20), aes(y = log10vl), alpha = 0.25, color = "red") +
+  geom_line(data = vl_pl_data, aes(y = log10vl), alpha = 0.25, colour = "red") +
+  geom_line() +
+  facet_wrap(~pubid, nrow = 3) +
+  scale_x_continuous(breaks = 0:12 * 2) +
+  labs(colour = "",
+       x = "Days post-administration",
+       y = vl_title
+  )   
+
+
+```
+
+
+`r insert_break()`
+
+# Reproducibility Software Information
+
+```{r Software-Session-Information, results="asis", message=FALSE, warning=F}
+library(flextable)
+# load in rmarkdown to capture version number
+if (any(installed.packages()[,1] == 'rmarkdown')) suppressWarnings(library(rmarkdown))
+
+my_session_info <- VISCfunctions::get_session_info()
+
+tbl_caption <- "Reproducibility software session information"
+
+if (output_type == 'latex') {
+  
+  # format nicely for PDF with kable and kableExtra
+  my_session_info$platform_table %>%
+    kable(booktabs = TRUE, linesep = "", caption = tbl_caption) %>% 
+    kable_styling() %>%
+    column_spec(1, width = "1in") %>%
+    column_spec(2, width = "5.5in")
+  
+} else {
+  
+  # format nicely for Word with flextable
+  my_session_info$platform_table %>%
+    flextable() %>%
+    set_caption(tbl_caption) %>%
+    set_table_properties(layout = "fixed") %>% # to allow overriding automatic column width
+    flextable::width(1, 1, unit = "in") %>%
+    flextable::width(2, 5.5, unit = "in")
+  
+}
+```
+
+```{r Software-Package-Version-Information, results="asis", warning=kable_warnings}
+
+tbl_caption <- "Reproducibility software package version information"
+
+if (output_type == 'latex') {
+  
+  # format nicely for PDF with kable and kableExtra
+  my_session_info$packages_table %>%
+    kable(booktabs = TRUE, linesep = "", caption = tbl_caption) %>% 
+    kable_styling()
+  
+} else {
+  
+  cat(insert_break())
+  
+  # format nicely for Word with flextable
+  my_session_info$packages_table %>%
+    flextable() %>%
+    set_caption(tbl_caption)
+  
+}
+```

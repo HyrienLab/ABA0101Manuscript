@@ -1,0 +1,294 @@
+---
+title: "ABA-0101: Anti-drug activity (ADA) analysis of 10E8.4/iMab"
+author: "Bryan Mayer"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    keep_tex: true
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(rprojroot)
+library(flextable)
+library(conflicted)
+library(glue)
+library(knitr)
+
+source(find_rstudio_root_file("R/config-setup.R"))
+source(find_rstudio_root_file("R/output-funs.R"))
+
+# knitr options
+opts_chunk$set(cache = FALSE, message = FALSE, warning = FALSE, echo = FALSE, 
+               dev = c("png", "pdf"), dpi = 200, out.width = "100%", 
+               out.extra = "", fig.align = "center", fig.pos = "H")
+
+# NA's will be blank in tables
+options(knitr.kable.NA = '')
+
+# Create a theme 
+visc_theme <- theme_classic() + 
+  theme(
+    legend.position = "bottom", 
+    legend.margin = margin(unit = "cm"),
+    panel.grid.minor = element_blank()
+    )
+
+theme_set(visc_theme)
+
+conflict_prefer("filter", "dplyr")
+output_type = get_output_type()
+
+```
+
+
+```{r word-pdf-options}
+kable_warnings <- T
+```
+
+```{r load-raw-data}
+elisa_data_all = read_csv(find_rstudio_root_file("data/ABA0101-ELISA.csv"),
+                          show_col_types = F)
+ada_data_all = read_csv(find_rstudio_root_file("data/ABA0101-ADA.csv"), 
+                        show_col_types = F) 
+
+# Group variables for merging 
+group_variables <- elisa_data_all %>% 
+  mutate(group_label = glue("Group {group}: {dose} {dose_units} {route}")) %>% 
+  distinct(pubid, group, group_label, dose, dose_units, weight, weight_unit) %>% 
+  mutate(dose_amount = dose*weight)
+
+```
+
+```{r elisa-data-processing}
+
+elisa_data = elisa_data_all %>%
+  filter(
+    analyte != "Placebo", 
+    !is.na(concentration)
+    ) %>%
+  mutate(
+    # VDC removal (April 2022)
+    concentration = if_else(pubid == "1450" & visitno == "8", 200, concentration),
+    hiv_status = if_else(arm == "3", "pos", "neg"),
+    concentration_ug = concentration/1000,
+    group_label = glue("{group}: {dose} {dose_units}"),
+    group_label_route = glue("{group}: {dose} {dose_units} {route}")
+  )
+  
+elisa_summary = elisa_data %>% 
+  group_by(route, study_day, group_label,hiv_status) %>% 
+  summarise(
+    outcome = "conc",
+    n = n(),
+    mean = mean(concentration_ug),
+    se = sqrt(var(concentration_ug)/length(concentration_ug)),
+    lower = mean - se,
+    upper = mean + se,
+    .groups = "drop"
+  ) %>%
+  left_join(route_label, by = "route")
+```
+
+```{r ada-data}
+ada_data = ada_data_all %>% 
+  filter(analyte == "10E8.4/iMab") %>% 
+  filter((visitno != "12" & group %in% c("A", "B", "C", "D", "E", "F", "J", "K")) |
+           arm == 3) %>% # sloppy
+  mutate(
+    group_label = glue("{group}: {dose} {dose_units} {route}"),
+    sample_status = if_else(titer == "NP", "Sample not provided", "Sample available"),
+    Cohort = if_else(arm == "3", "PWH", "PWoH"),
+    assay_result = case_when(
+      titer == "-" ~ "Tier 2 negative",
+      titer == "NP" ~ NA_character_,
+      TRUE ~ "Tier 2 positive"
+      ),
+    titer_num = parse_number(if_else(titer == "NP", NA_character_, if_else(titer == "-", "0.2", titer)))
+    ) %>% 
+  select(network:titer, sample_status, assay_result, titer_num, everything()) %>%
+  group_by(pubid) %>%
+  # some time calculations
+  mutate(
+    ada_day = suppressWarnings({if_else(result == "ada negative", max(day), 
+                                         if_else(result == "treatment induced",
+                                           min(day[titer_num > 0.2], na.rm = T),
+                                           min(day[titer_num >= 3 * titer_num[study_day == 0]], na.rm = T)))
+      }),
+    ada_study_day = suppressWarnings({if_else(result == "ada negative", max(study_day), 
+                                         if_else(result == "treatment induced",
+                                           min(study_day[titer_num > 0.2], na.rm = T),
+                                           min(study_day[titer_num >= 3 * titer_num[study_day == 0]], na.rm = T)))
+      }),
+    ada_before_d28 = ada_study_day <= 28
+         ) %>%
+  ungroup()
+
+```
+
+# Overview
+
+This script analyzes and summarizes the anti-drug activity (ADA) in participants receiving 10E8.4/iMab. This analysis does not comprise all ADA results presented in the manuscript.
+
+# Manuscript Tables
+
+## Table 3: ADA Table
+
+```{r ada-table-summary}
+caption = "ADA table"
+
+ada_status_counts = ada_data %>% 
+  bind_rows(mutate(ada_data, group_label = "")) %>%
+   distinct(pubid, Cohort, Group = group_label, result) %>%
+   group_by(Cohort, Group) %>% 
+   mutate(
+    N = n(),
+    result = if_else(result == "not defined", "Baseline missing", Hmisc::capitalize(result)),
+    result = str_replace(result, "Ada negative", "Negative"),
+  ) %>%
+   count(Cohort, Group, N, result, name = "total") %>% 
+   pivot_wider(names_from = result, values_from = total, values_fill = 0) %>%
+  relocate(`Baseline missing`, Negative, .after = last_col())
+
+ada_day_tab = ada_data %>% 
+  bind_rows(mutate(ada_data, group_label = "")) %>%
+  distinct(pubid, result, ada_study_day, Cohort, Group = group_label) %>%
+  filter(result == "treatment induced" | result == "treatment boosted") %>% 
+  group_by(Group, Cohort) %>% 
+  summarize(`ADA Day (median [range])` = paste_median_minmax(ada_study_day, digits = 0), .groups = "drop")
+
+output_table = ada_status_counts %>% 
+  left_join(ada_day_tab, by = c("Group", "Cohort")) %>%
+  mutate(
+    Group = factor(Group),
+    Group = fct_relevel(Group, "", after = Inf)
+    ) %>%
+  arrange(desc(Cohort), Group) 
+
+if(output_type == 'latex' | interactive()){
+ output_table %>%
+  kable(
+    format = output_type,
+    caption = caption,
+    caption.short = "Total ADA positive participants by group.",
+    escape = FALSE,
+    booktabs = TRUE,
+  ) %>%
+   kable_styling(latex_options = c("scale_down", "hold_position")) 
+} else{
+  
+    output_table %>%
+    flextable()%>%
+    set_caption("ADA") %>%
+    padding(padding = 0, part = "all") %>% 
+    colformat_double(digits = 2) %>%
+    fontsize(size = 8, part = "all") %>%
+    autofit() 
+  
+} 
+
+```
+
+`r insert_break()`
+
+# Manuscript Figures
+
+## Ext Fig 8: ADA Plot
+
+```{r ada-high-dose-iv, fig.height=7, fig.cap="10E8.4/iMab concentration ($\\mu$g/mL, black lines, left axis) over time (days relative to study administration) with overlaid Tier 3 ADA titer (blue, right axis) for each participant in IV Groups E (10 mg/kg) and F (30 mg/kg). For comparison, participants without an ADA positive response are plotted without measured ADA titers. For participants with any ADA response (induced or boosted), dashed lines interpolate trends between time points prior to ADA positivity and solid lines interpolate post-positivity. While several participants were ADA positive late in the study (day 84 or later), the x-axis was truncated to day 50 to enable comparison with serum concentration data.", fig.scap="10E8.4/iMab concentration vs. ADA titer (IV Groups E and F)."}
+
+ada_data %>%
+  dplyr::filter(study_day <= 100 & group %in% c("E", "F") & !is.na(titer_num) & result != "ada negative") %>%
+  mutate(post_ADA = study_day > ada_study_day, post_ADA2 = study_day >= ada_study_day, #post_ADA2 connects lines
+         group_label_route = group_label) %>% 
+  ggplot(aes(x = day, y = titer_num)) +
+  geom_point(col = "blue", size = 0.5) +
+  geom_line(aes(linetype = factor(post_ADA)), col = "blue") +
+  geom_line(aes(linetype = factor(post_ADA2)), col = "blue") +  
+  facet_wrap(group_label_route ~ pubid, nrow = 4, ncol = 3) +
+    scale_y_log10(sec.axis = sec_axis(~., name = "ADA Titer",
+                                      breaks = c(1, 10, 100, 1000))#
+                  ) +
+  geom_point(
+    data = dplyr::filter(elisa_data, group %in% c("E", "F")),
+    aes(y = concentration_ug)
+    ) +
+  geom_line(
+    data = dplyr::filter(elisa_data, group %in% c("E", "F")),
+    aes(y = concentration_ug)
+   ) +
+  scale_linetype_manual(values = 2:1, labels = c("Prior", "Post")) +
+  coord_cartesian(xlim = c(0, 50)) +
+  labs(
+    col = "Tier",
+    linetype = "ADA positivity", 
+    y = conc_title,
+    x = "Day post administration") +
+  theme_bw() +
+  theme(legend.position = "top", strip.text = element_text(size = 8),
+        axis.title.y.right = element_text(color="blue"), 
+        axis.text.y.right = element_text(color="blue"),
+        panel.grid.minor = element_blank()
+          ) 
+
+```
+
+
+`r insert_break()`
+
+# Reproducibility Software Information
+
+```{r Software-Session-Information, results="asis", message=FALSE, warning=F}
+library(flextable)
+# load in rmarkdown to capture version number
+if (any(installed.packages()[,1] == 'rmarkdown')) suppressWarnings(library(rmarkdown))
+
+my_session_info <- VISCfunctions::get_session_info()
+
+tbl_caption <- "Reproducibility software session information"
+
+if (output_type == 'latex') {
+  
+  # format nicely for PDF with kable and kableExtra
+  my_session_info$platform_table %>%
+    kable(booktabs = TRUE, linesep = "", caption = tbl_caption) %>% 
+    kable_styling() %>%
+    column_spec(1, width = "1in") %>%
+    column_spec(2, width = "5.5in")
+  
+} else {
+  
+  # format nicely for Word with flextable
+  my_session_info$platform_table %>%
+    flextable() %>%
+    set_caption(tbl_caption) %>%
+    set_table_properties(layout = "fixed") %>% # to allow overriding automatic column width
+    flextable::width(1, 1, unit = "in") %>%
+    flextable::width(2, 5.5, unit = "in")
+  
+}
+```
+
+```{r Software-Package-Version-Information, results="asis", warning=kable_warnings}
+
+tbl_caption <- "Reproducibility software package version information"
+
+if (output_type == 'latex') {
+  
+  # format nicely for PDF with kable and kableExtra
+  my_session_info$packages_table %>%
+    kable(booktabs = TRUE, linesep = "", caption = tbl_caption) %>% 
+    kable_styling()
+  
+} else {
+  
+  cat(insert_break())
+  
+  # format nicely for Word with flextable
+  my_session_info$packages_table %>%
+    flextable() %>%
+    set_caption(tbl_caption)
+  
+}
+```

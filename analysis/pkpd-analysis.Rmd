@@ -1,0 +1,784 @@
+---
+title: "ABA-0101: PKPD Analysis of 10E8.4/iMab"
+author: "Bryan Mayer"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    keep_tex: true
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(kableExtra)
+library(rprojroot)
+library(flextable)
+library(conflicted)
+library(patchwork)
+library(glue)
+library(ggbeeswarm)
+library(knitr)
+library(ggh4x)
+
+source(find_rstudio_root_file("R/config-setup.R"))
+source(find_rstudio_root_file("R/output-funs.R"))
+source(find_rstudio_root_file("R/plot-funs.R"))
+
+# knitr options
+opts_chunk$set(cache = FALSE, message = FALSE, warning = FALSE, echo = FALSE, 
+               dev = c("png", "pdf"), dpi = 200, out.width = "100%", 
+               out.extra = "", fig.align = "center", fig.pos = "H")
+
+# NA's will be blank in tables
+options(knitr.kable.NA = '')
+
+# Create a theme 
+visc_theme <- theme_classic() + 
+  theme(
+    legend.position = "bottom", 
+    legend.margin = margin(unit = "cm"),
+    panel.grid.minor = element_blank()
+    )
+
+theme_set(visc_theme)
+
+conflict_prefer("filter", "dplyr")
+output_type = get_output_type()
+
+```
+
+
+```{r word-pdf-options}
+kable_warnings <- T
+```
+
+```{r load-raw-data}
+elisa_data_all = read_csv(find_rstudio_root_file("data/ABA0101-ELISA.csv"),
+                          show_col_types = F)
+cd4ro_data_all = read_csv(find_rstudio_root_file("data/ABA0101-cd4ro.csv"),
+                          show_col_types = F)
+cd4pct_data_all = read_csv(find_rstudio_root_file("data/ABA0101-cd4pct.csv"),
+                           show_col_types = F) %>%
+  filter(!is.na(cd4_pct) & !is.na(dose))
+
+# Group variables for merging 
+group_variables <- elisa_data_all %>% 
+  mutate(group_label = glue("Group {group}: {dose} {dose_units} {route}")) %>% 
+  distinct(pubid, group, group_label, dose, dose_units, weight, weight_unit) %>% 
+  mutate(dose_amount = dose*weight)
+
+```
+
+```{r elisa-data-processing}
+
+elisa_data = elisa_data_all %>%
+  filter(
+    analyte != "Placebo", 
+    !is.na(concentration)
+    ) %>%
+  mutate(
+    # VDC removal (April 2022)
+    concentration = if_else(pubid == "1450" & visitno == "8", 200, concentration),
+    hiv_status = if_else(arm == "3", "pos", "neg"),
+    concentration_ug = concentration/1000,
+    group_label = glue("{group}: {dose} {dose_units}")) 
+  
+elisa_summary = elisa_data %>% 
+  group_by(route, study_day, group_label,hiv_status) %>% 
+  summarise(
+    outcome = "conc",
+    n = n(),
+    mean = mean(concentration_ug),
+    se = sqrt(var(concentration_ug)/length(concentration_ug)),
+    lower = mean - se,
+    upper = mean + se,
+    .groups = "drop"
+  ) %>%
+  left_join(route_label, by = "route")
+```
+
+```{r cd4ro-data-processing}
+
+cd4ro_data <-cd4ro_data_all %>% 
+  mutate(hiv_status = if_else(hiv_status == "positive", "pos", hiv_status)) %>%
+  filter(
+    analyte != "Placebo", 
+    !is.na(cd4ro)
+    ) %>%
+  mutate(
+    group_label = glue("{group}: {dose} {dose_units}"),
+    # truncate cd4ro data between 0 and 100
+    cd4ro_trunc = pmin(pmax(cd4ro, 0), 100)
+    ) %>%
+  left_join(route_label, by = "route")
+
+cd4ro_summary = cd4ro_data %>% 
+  group_by(route, study_day, group_label, hiv_status) %>% 
+  summarise(
+    outcome = "cd4ro",
+    n = n(),
+    mean = mean(cd4ro_trunc),
+    se = sqrt(var(cd4ro_trunc)/length(cd4ro_trunc)),
+    lower = mean - se,
+    upper = mean + se,
+    .groups = "drop"
+  ) %>%
+  left_join(route_label, by = "route")
+
+mean_summary_data = bind_rows(elisa_summary, cd4ro_summary)
+```
+
+
+```{r cd4pct-data}
+
+cd4_data = cd4pct_data_all %>%
+  # groups with consistent data
+  filter(group %in% c("E", "F", "H", "I", "K")) %>% 
+  mutate(
+    cohort = if_else(arm == 3, "PWH", "PWOH"),
+    group_label = glue("Group {group}: {dose} {dose_units} {route}"),
+         group_cohort = glue("{cohort} {group_label}"))
+
+cd4_pct_summary = cd4_data %>%
+  group_by(pubid, group) %>%
+  summarize(
+    baseline = if (any(study_day <= 0)) mean(cd4_pct[study_day <= 0]) else NA_real_,
+    cd4_day28 = if (any(study_day == 28))  mean(cd4_pct[study_day == 28]) else NA_real_,
+    cd4_post = if (any(study_day > 28)) mean(cd4_pct[study_day > 28]) else NA_real_,
+    .groups = "drop"
+  )  %>%
+  pivot_longer(cols = -c(pubid, group), names_to = "study_time", values_to = c("cd4_pct")) %>%
+  filter(!is.na(cd4_pct)) 
+
+```
+
+
+```{r load-pk-data}
+
+# see PK-modeling/compile-mlx-results.R for summary of raw mlx output
+pwh_pkpd_models = read_rds(find_rstudio_root_file("PK-modeling/pk-output-data/PWH-pkpd-models.rds"))
+pwoh_pkpd_models = read_rds(find_rstudio_root_file("PK-modeling/pk-output-data/PWOH-pkpd-models.rds"))
+
+pwoh_pkpd_simulx = read_rds(find_rstudio_root_file("PK-modeling/pk-output-data/PWOH-simulx-res.rds"))
+pwoh_simulx_final =  filter(pwoh_pkpd_simulx, model == "PWOH PKPD 2-cmpt time-dependent mm")
+
+pwh_pkpd_simulx = read_rds(find_rstudio_root_file("PK-modeling/pk-output-data/PWH-simulx-res.rds"))
+pwh_simulx_covadj =  filter(pwh_pkpd_simulx, model == "PWH PKPD (ADJ)")
+
+```
+
+```{r pk-parms}
+
+pwoh_pk_parms <- pwoh_pkpd_models %>% 
+  filter(model == "PWOH PK 2-cmpt time-dependent mm") %>% 
+  select(pop_params) %>% 
+  unnest(pop_params) %>% 
+  mutate(
+    pwoh_estimate = if_else(parameter == "Km_pop", "0.2", stat_paste(value, rse, digits = 2)),
+    parameter = if_else(parameter == "Vend_pop", "Vm_pop", parameter),
+    parameter = if_else(parameter == "b", "b1", parameter)
+  )
+
+pwoh_pd_parms <- pwoh_pkpd_models %>% 
+  filter(model == "PWOH PKPD 2-cmpt time-dependent mm") %>% 
+  select(pop_params) %>% 
+  unnest(pop_params) %>% 
+  filter(!is.na(rse)) %>% 
+  mutate(
+    pwoh_estimate = stat_paste(value, rse, digits = 2)
+  )
+
+pwoh_pkpd_parms = bind_rows(pwoh_pk_parms, pwoh_pd_parms) %>%
+  left_join(pkpd_parameters_mm, by = "parameter")
+
+pk_parms_table = pwh_pkpd_models %>%
+  filter(model %in% c("PWH PK", "PWH PK (ADJ)")) %>% 
+  unnest(pop_params) %>%
+  filter(!is.na(rse))
+
+pd_parms_table = pwh_pkpd_models %>% 
+  filter(model %in% c("PWH PKPD", "PWH PKPD (ADJ)")) %>% 
+  unnest(pop_params) %>%
+  filter(!is.na(rse))
+
+
+```
+
+
+```{r make-mean-plots}
+
+# these loops generate the observed/mean conc & CD4RO data plots for PWOH and PWH
+
+conc_plots = map(set_names(unique(mean_summary_data$route)), function(r){
+  map(set_names(unique(mean_summary_data$hiv_status)), function(hiv){
+    
+    if(r == "SC" & hiv == "pos") return(NULL) # no matching group
+    
+    pl = elisa_summary %>% 
+      filter(route == r & hiv_status == hiv) %>%
+      ggplot(aes(x = study_day, y = mean, ymin = lower, ymax = upper, 
+                 color = group_label, group = group_label)) +
+      .mean_plots_boiler(r) +
+      scale_y_log10(
+        limits = c(0.2, max(elisa_summary$upper)),
+        breaks = c(.2, 1, 10, 100, 1000),
+        labels = c(expression("" <= .2), '1', '10', '100', '1,000')
+      ) +
+      facet_nested(~route_pl) +
+      labs(
+        y = conc_title,
+      ) +
+      theme(legend.position = "right", legend.direction = "vertical")
+    list(
+      plot = pl + theme(legend.position = "none"),
+      leg = cowplot::get_plot_component(pl, "guide-box-right")
+    )
+        
+  })
+})
+
+cd4ro_plots = map(set_names(unique(mean_summary_data$route)), function(r){
+  map(set_names(unique(mean_summary_data$hiv_status)), function(hiv){
+    
+    if(r == "SC" & hiv == "pos") return(NULL) # no matching group
+    
+    pl = cd4ro_summary %>% 
+      filter(route == r & hiv_status == hiv) %>% 
+      ggplot(aes(x = study_day, y = mean, ymin = lower, ymax = upper, 
+                 color = group_label, group = group_label)) +
+      .mean_plots_boiler(r) +
+      ylim(c(0, 100)) +
+      labs(
+        y = "% CD4RO"
+      )
+    list(
+      plot = pl + theme(legend.position = "none"),
+      leg = cowplot::get_plot_component(pl, "guide-box-bottom")
+    )
+    
+  })
+})
+
+```
+
+```{r poppk-pi-plots}
+# VPC same as poppk mean predictions with 90% PI
+
+vpc_neg_conc_pl = .draw_vpc_plot(
+  input_pk_df = left_join(elisa_data, route_label, by = "route"),
+  subgroups = c("C", "D", "E", "F", "J", "K"),
+  pop_int = left_join(unnest(pwoh_simulx_final, pop_int_conc), 
+                      route_label, by = c("route" = "route_no")),  
+  yvar = "L"
+) +
+  facet_nested(~ route_pl + group_label)
+
+vpc_neg_cd40ro_pl = .draw_vpc_plot(
+  input_pk_df = cd4ro_data,
+  subgroups = c("C", "D", "E", "F", "J", "K"),
+  pop_int = left_join(unnest(pwoh_simulx_final, pop_int_cd4ro), 
+                      route_label, by = c("route" = "route_no")),  
+  yvar = "PT"
+) +
+  facet_wrap(vars(group_label), ncol = 6)
+
+vpc_pos_conc_pl = .draw_vpc_plot(
+  input_pk_df = elisa_data,
+  subgroups = c("H", "I"),
+  pop_int = unnest(pwh_simulx_covadj, pop_int_conc),
+  yvar = "L"
+) +
+  facet_wrap(~ group_label)
+
+vpc_pos_cd40ro_pl = .draw_vpc_plot(
+  input_pk_df = cd4ro_data,
+  subgroups = c("H", "I"),
+  pop_int = unnest(pwh_simulx_covadj, pop_int_cd4ro),
+  yvar = "PT"
+) +
+  facet_wrap(vars(group_label))
+  
+```
+
+# Overview
+
+This analysis script displays the results of the PKPD modeling of 10e8.4/iMab in PWOH and PWH study populations.
+
+PKPD modeling was done in Monolix. The raw Monolix project outputs are in `PK-modeling/MLX-projects`. Key output from the modeling has been collated into nested tibble data objects loaded here for figures and tables.
+
+`r insert_break()`
+
+# Manuscript Figures
+
+## Figure 2: PWOH PK Analysis
+
+### Figure 2A: PWOH Mean plots
+
+```{r mean-plot, fig.cap="Mean 10E8.4/iMab concentration and CD4RO over time (planned study day) by study group (color). The group mean at each visit day is represented by a point; error bars indicate plus/minus one standard error (truncated at the LLoQ, 0.2 $\\mu$g/mL).", fig.scap="Mean 10E8.4/iMab concentration and CD4R0 over time."}
+
+conc_neg = (conc_plots[["IV"]][["neg"]][["plot"]] + labs(x = "")) + 
+  (conc_plots[["SC"]][["neg"]][["plot"]] + labs(x = "")) + 
+  plot_layout(guides = "collect", axis_titles = "collect")
+
+cd4ro_neg =  cd4ro_plots[["IV"]][["neg"]][["plot"]] + cd4ro_plots[["SC"]][["neg"]][["plot"]] + 
+  plot_layout(guides = "collect", axis_titles = "collect")
+
+stack_mean = conc_neg / cd4ro_neg + plot_layout(axis_titles = "collect")
+
+legend_iv_left <- wrap_legend_plot(conc_plots[["IV"]][["neg"]][["leg"]])
+legend_sc_left <- wrap_legend_plot(conc_plots[["SC"]][["neg"]][["leg"]]) 
+leg_plots = legend_iv_left / legend_sc_left
+
+cowplot::plot_grid(stack_mean, leg_plots, rel_widths = c(4,1))
+
+```
+
+
+### Figure 2B: Model diagram (no code)
+
+### Figure 2C: PWOH PopPK Prediction plots
+
+```{r pwoh-vpc, fig.cap = "PWOH VPC plot", fig.height=5, fig.width=10}
+(vpc_neg_conc_pl + labs(x = ""))/(vpc_neg_cd40ro_pl + theme(strip.text = element_blank())) +
+  plot_layout(axis_titles = "collect")
+
+```
+
+## Figure : PWH PK Analysis
+
+### Figure 3A: PWH Mean plots
+
+```{r pwh-mean, fig.cap = 'PWH mean concentration'}
+
+(conc_plots[["IV"]][["pos"]][["plot"]] + labs(x = "") + theme(strip.text = element_blank(), axis.title.y = element_text(size = 9)))/cd4ro_plots[["IV"]][["pos"]][["plot"]]
+
+```
+
+### Figure 3B: PWH PopPK Prediction plots
+
+
+```{r pwh-vpc, fig.cap = 'PWH VPC plot'}
+
+(vpc_pos_conc_pl + labs(x = ""))/vpc_pos_cd40ro_pl
+
+```
+
+### Figure 3C/D: See viral load analysis file
+
+`r insert_break()`
+
+## Ext Fig 4: CD4 Plots
+
+```{r cd4-pl, fig.height=6.5, fig.cap = "CD4 levels"}
+cd4_pls = map(c("cd4_pct", "cd4_count"), function(i){
+  ytitle = switch(i, 
+                  cd4_pct  = "CD4 percent",
+                  cd4_count = "CD4 Count (cells/µL)")
+  ylims = switch(i, 
+                  cd4_pct  = c(0, 75),
+                  cd4_count = c(0, 3000))
+  
+  cd4_data$outcome = cd4_data[[i]]
+  cd4_data %>%
+    ggplot(aes(x = study_day, y = outcome)) +
+    geom_point() +
+    geom_line(aes(group = pubid)) +
+    facet_wrap(~group_label, nrow = 5) +
+    scale_y_continuous(limits = ylims) +
+    theme_bw() +
+    labs(x = "Day post-administration", y = ytitle)
+  
+})
+
+cd4_pls[[1]] + cd4_pls[[2]]
+
+
+```
+
+## Ext Fig 5: PWOH Simulations
+
+```{r model-simulations, fig.cap="Simulated 10E8.4/iMab concentration over time (days relative to study administration) from two dosing scenarios: 10 mg/kg SC and 30 mg/kg IV. In both scenarios 3 doses were administered 28 days apart. The solid line is the simulated median concentration and the blue shaded area is the 90\\% prediction interval. The red dashed line represents the LLoQ.", fig.scap="Trial simulations."}
+
+read_csv(find_rstudio_root_file("PK-modeling/pk-output-data/PWOH-clinical-trial-sims.csv"),
+         show_col_types = F) %>% 
+  mutate(prediction = if_else(prediction == "30 mg/kg x 3 doses", "30 mg/kg IV x 3 doses", prediction)) %>% 
+  filter(time < 80) %>% 
+  ggplot(aes(x = time, y = `50%`, ymin = `5%`, ymax = `95%`)) +
+  geom_ribbon(fill = "lightblue") +
+  geom_line() +
+  geom_hline(yintercept = .2, linetype = "dashed", color = "pink") +
+  scale_y_log10(
+    breaks = c(.2, 1, 10, 100, 1000),
+    labels = c(expression("" <= .2), '1', '10', '100', '1,000'),
+    limits = c(.2, 3000)
+  ) +
+  facet_wrap(vars(prediction), ncol = 1) +
+  theme_bw() +
+  labs(
+    y = "Predicted 10E8.4/iMab Concentration",
+    x = "Days post-first administration"
+  )
+```
+
+## Supp Fig 1: PWOH - Time-dependent vs. standard MM
+
+```{r prelim-model-comp, fig.height=5, fig.width=7, fig.cap="Observed 10E8.4/iMab individual concentrations with population-predicted PK (group mean dose; lines, colored by model-type) for the high dose IV groups.", fig.scap="Preliminary PK model comparison (high dose IV groups)."}
+
+# A tibble: 2 × 2
+#   group `mean(dose_amount)`
+#   <chr>               <dbl>
+#   E                    852.
+#   F                   2280 
+
+# # A tibble: 12 × 3
+#    pubid group dose_amount
+#    <chr> <chr>       <dbl>
+#   1995  E             850
+#   1578  F            2280
+
+# used ptid predictions as they were approx mean dose (no simulx output)
+
+pwoh_pkpd_models %>%
+  filter(model == "PWOH PK 1-cmpt mm") %>%
+  select(model_name, fits_conc) %>%
+  unnest(fits_conc) %>%
+  rename(pubid = ID) %>%
+  left_join(group_variables, by = "pubid") %>%
+  filter(group %in% c("E", "F") & pubid %in% c("1995", "1578"))  %>%
+  bind_rows(
+    mutate(filter(unnest(pwoh_simulx_final, pop_int_conc), 
+                  group %in% c("E", "F")), 
+           popPred  = `50%`)
+  ) %>%
+  mutate(
+   group_label = simplify_group_label(group_label),
+    model_description = case_when(
+      model_name == "tmdd-1cmpt-mm-ivsc-initial" ~ "Michaelis-Menten",
+      model_name == "tmdd_2cmpt_model_pkpd2" ~ "Time-dependent Michaelis-Menten"
+    )
+    ) %>%
+  group_by(time, group, group_label, model_name, model_description) %>%
+  mutate(
+    concentration = pmax(0.2, popPred)
+  ) %>%
+  filter(time > 0.1) %>%
+  ggplot(aes(x = time, y = concentration)) +
+    geom_point(
+      data = filter(elisa_data, group %in% c("E", "F") & day > 0),
+      aes(
+        x = day,
+        y = concentration_ug
+      ),
+      alpha = .6
+    ) +
+  geom_line(aes(linetype = model_description)) +
+  scale_y_log10(
+    breaks = c(.2, 1, 10, 100, 1000),
+    labels = c(as.expression(bquote("" <= .(0.02))), 1, 10, 100, 1000)
+    ) +
+  coord_cartesian(xlim = c(0, 35)) +
+  facet_wrap(vars(group_label), nrow = 1) +
+  scale_linetype_manual(values = c(2, 1)) +
+  labs(
+    colour = "",    
+    linetype = "",    
+    x = "Days post-administration",
+    y = expression("10E8.4/iMab Concentration ("*mu*"g/ml)")
+    )
+
+```
+
+## Supp Fig 2: PWH - Time-dependent vs. standard
+
+```{r hiv-pos-model-comp}
+
+pwh_pkpd_simulx %>%
+  filter(model %in% c("FIXED: PWOH PKPD", "PWH PKPD (ADJ)")) %>%
+  unnest(pop_mean_conc) %>%
+  mutate(
+    concentration = pmax(0.2, L)
+  ) %>%
+  ggplot(aes(x = time, y = concentration)) +
+    geom_point(
+      data = filter(elisa_data, hiv_status == "pos" & day > 0),
+      aes(
+        x = day,
+        y = concentration_ug
+      ),
+      alpha = .6
+    ) +
+  geom_line(aes(colour = model)) +
+  scale_y_log10(
+    breaks = c(.2, 1, 10, 100, 1000),
+    labels = c(expression("" <= .2), '1', '10', '100', '1,000')
+  ) +
+  coord_cartesian(xlim = c(0, 35)) +
+  facet_wrap(vars(simplify_group_label(group_label)), nrow = 1) +
+  scale_color_manual("PK/PD Model", values = c("black", "blue"), 
+                     labels = c("Time-dependent Michaelis-Menten (PWOH)", 
+                                "Michaelis-Menten (PWH)")) +
+  labs(
+    colour = "",    
+    x = "Days post-administration",
+    y = conc_title
+    )
+
+```
+
+## Supp Fig 3: Baseline CD4 pct vs. individual-level clearance
+
+```{r predicted-cl, fig.cap = "Estimated relationship between central compartment clearance (L/day) and baseline CD4 percent among participants living with HIV. The points represent the individual observations of baseline CD4 percent with individual clearance predicted by the final population PK models among the participants living with HIV (solid points) and without HIV (Groups E and F, open points). The corresponding diamonds indicate the average values. The line depicts the covariate relationship estimated by the covariate-adjusted PK model in the participants with HIV, with the solid portion of the line representing the baseline CD4 percent range observed in this cohort and its dashed portion representing extrapolated predictions for the baseline CD4 percent range observed in the participants without HIV.", fig.scap="Clearance vs. baseline CD4", fig.height=5}
+
+baseline_cd4pct = filter(cd4_pct_summary, study_time == "baseline")
+
+# only plot where we have data
+pwoh_indiv_cl = pwoh_pkpd_models %>%
+  filter(model == "PWOH PKPD 2-cmpt time-dependent mm") %>%
+  select(individual_parameters) %>%
+  unnest(individual_parameters) %>%
+  select(pubid = id, cl_pred = Cl_mode) %>%
+  inner_join(baseline_cd4pct, by = "pubid")
+
+pwh_indiv_cl = pwh_pkpd_models %>%
+  filter(model == "PWH PKPD (ADJ)")  %>%
+  unnest(individual_parameters) %>% 
+  select(pubid = id, cl_pred = Cl_mode) %>%
+  left_join(baseline_cd4pct, by = "pubid")
+
+# this snippet of code computes the inferred relationship between CD4pct and predicted clearance based on the model
+pwh_pkpd_covadj_parms = pwh_pkpd_models %>%
+  filter(model == "PWH PKPD (ADJ)") %>%
+  unnest(pop_params) %>%
+  select(parameter, value) %>%
+  spread(parameter, value)
+
+
+range_seq = function(x, by = 1) seq(range(x)[1], range(x)[2], by = by)
+# within range of PWH data
+predicted_cd4 = tibble(
+  cd4_pct = range_seq(pwh_indiv_cl$cd4_pct),
+  cl_pred = exp(log(pwh_pkpd_covadj_parms$Cl_pop) + pwh_pkpd_covadj_parms$beta_Cl_logcd4 * log(cd4_pct/38.5))
+)
+
+# extended range with PWOH data (CD4 pct PWOH > PWH)
+extrapolated_cd4 = tibble(
+  cd4_pct = range_seq(pwoh_indiv_cl$cd4_pct),
+  cl_pred = exp(log(pwh_pkpd_covadj_parms$Cl_pop) + pwh_pkpd_covadj_parms$beta_Cl_logcd4 * log(cd4_pct/38.5))
+) %>%
+  filter(cd4_pct >= max(predicted_cd4$cd4_pct))
+
+avg_cd4_cl = tibble(
+  cd4_pct = c(median(pwh_indiv_cl$cd4_pct), median(pwoh_indiv_cl$cd4_pct)),
+  cl_pred = c(pwh_pkpd_covadj_parms$Cl_pop, pwoh_pk_parms$value[pwoh_pk_parms$parameter == "Cl_pop"])
+)
+
+pwh_indiv_cl %>%
+  ggplot(aes(x = cd4_pct, y = cl_pred)) +
+  geom_point() +
+  scale_x_log10(breaks = c(25, 30, 40, 50)) +
+  scale_y_log10(breaks = c(1:4/10)) +
+  geom_point(data = pwoh_indiv_cl, shape = 21) +
+  geom_line(data = predicted_cd4) +
+  geom_line(data = extrapolated_cd4, linetype = "dashed") + 
+  geom_point(data = avg_cd4_cl, shape = 23, size = 3, aes(fill = factor(1:2))) +
+  scale_fill_manual(guide = "none", values = c("black", "white")) +
+  labs(
+    y = "Predicted clearance (L/day)",
+    x = "Baseline CD4 (%)")
+  
+
+```
+
+`r insert_break()`
+
+# Manuscript Tables
+
+## Table 2: PK Parm Table
+
+```{r pk-parms-table}
+
+caption = "PK parm table"
+
+pk_table = pk_parms_table %>%
+  mutate(
+    parameter = if_else(parameter == "b", "b1", parameter),
+    parameter = if_else(parameter == "Vstart_pop", "Vm_pop", parameter)
+    ) %>%
+  bind_rows(pd_parms_table) %>%
+  mutate(
+    model_table = case_when(
+      str_detect(model, "ADJ") ~ "PWH (Covariate-Adjusted)",
+      T ~ "PWH (Base)"
+    ),
+    estimate = stat_paste(value, rse, digits = 2)
+    ) %>%
+  pivot_wider(id_cols = parameter, values_from = estimate, names_from = model_table) %>%
+  add_row(parameter = "Km_pop", `PWH (Base)` = "0.2", `PWH (Covariate-Adjusted)` = "0.2") %>%
+  add_row(parameter = "omega_EC50", `PWH (Base)` = "", `PWH (Covariate-Adjusted)` = "") %>%
+  mutate(parameter_label = factor(parameter, levels = pkpd_parameters_mm$parameter,
+                                 labels = pkpd_parameters_mm$parameter_label)) %>% 
+  left_join(pkpd_parameters_mm[c("parameter", "parameter_description")], by = "parameter") %>% 
+  full_join(select(pwoh_pkpd_parms, parameter_label, parameter_description, pwoh_estimate), 
+            by = c("parameter_label", "parameter_description")) %>%
+  mutate(parameter_label = factor(parameter_label, levels = pkpd_parameters_mm$parameter_label)) %>%
+  arrange(parameter_label) %>% 
+  select(
+    Parameter = parameter_label,
+    Description = parameter_description,
+    `PWOH` = pwoh_estimate,
+    `PWH (Base)`,
+    `PWH (Covariate-Adjusted)`
+  ) 
+
+if (output_type == 'latex' | interactive()) {
+  pk_table %>% 
+    kable(
+      digits = 2,
+      format = output_type,
+      caption = caption,
+      caption.short = "Final PKPD model parameters.",
+      escape = FALSE,
+      booktabs = TRUE,
+      align = "llrrr"
+    ) %>% 
+    pack_rows("Fixed effects (PK)", 1, 12) %>% 
+    pack_rows("Fixed effects (PD)", 13, 14) %>% 
+    pack_rows("Standard deviations of the random effects", 15, 17) %>% 
+    pack_rows("Error model parameters", 18, 19) %>% 
+    add_header_above(c(" " = 2, "Estimate (\\\\%RSE)" = 3), escape = F) %>%
+    landscape() %>%
+    kable_styling(latex_options = c("scale_down", "HOLD_position"))
+  
+} else{
+  
+    pk_table %>%
+    flextable()%>%
+    set_caption(caption) %>%
+    padding(padding = 0, part = "all") %>% 
+    colformat_double(digits = 2) %>%
+    fontsize(size = 10, part = "all") %>%
+    autofit() 
+  
+}
+
+```
+
+## Supp. Table 1: PWH Covarate Selection
+
+```{r pwh-covariate}
+
+caption <- "Information criteria estimated for the PK models during covariate model building using the SCM algorithm (see Section \\ref{pk-building}). The base model represents the unadjusted PK model. Covariate-adjustments were implemented using a log-linear function with all covariates centered on their median. Adjustments included in the given model are denoted by parameter:covariate. The row for the final model selected (9) was highlighted yellow."
+
+read_csv(find_rstudio_root_file("PK-modeling/pk-output-data/PWH-covariate-SCM-results.csv"), show_col_types = F) %>%
+  mutate(
+    parms = str_replace_all(str_replace_all(parms, ":", ", "), "_", ":"),
+    parms = str_replace_all(parms, "Vstart", "Vm"),
+    parms = str_replace_all(parms, "V:", "Vc:") 
+  ) %>%
+  select(
+    `Model iteration` = run_no,
+    `Covariate-adjustment` = parms,
+    BICc,
+    `-Log likelihood` = loglik
+  ) %>% 
+  kable(
+    digits = 0,
+    format = output_type,
+    caption = caption,
+    caption.short = "Covariate model search results.",
+    escape = FALSE,
+    booktabs = TRUE,
+    align = "llrr"
+  ) %>%
+  row_spec(9, background = "yellow") %>%
+  kable_styling(latex_options = c("HOLD_position"))
+
+```
+
+`r insert_break()`
+
+# Additional results
+
+## PWOH Model Selection BICc
+
+```{r model-bicc}
+
+read_csv(find_rstudio_root_file("PK-modeling/pk-output-data/PWOH-model-exploration-summary.csv"), show_col_types = F) %>%
+  select(-model_code) %>%
+  rename(model = model_description, route = admin_type) %>%
+  kable(caption = "PWOH BICc", digits = 2, booktabs = TRUE) %>%
+  kable_styling(latex_options = "HOLD_position")
+
+```
+
+## PWH Model Selection BICc
+
+```{r}
+
+pwh_pkpd_models  %>%
+  unnest(loglikelihood_table) %>%
+  select(model, parameter, value) %>%
+  spread(parameter, value) %>%
+  select(model, BICc) %>%
+  kable(caption = "PWH BICc", digits = 2, booktabs = TRUE) %>%
+  kable_styling(latex_options = "HOLD_position")
+
+
+```
+
+`r insert_break()`
+
+# Reproducibility Software Information
+
+```{r Software-Session-Information, results="asis", message=FALSE, warning=F}
+library(flextable)
+# load in rmarkdown to capture version number
+if (any(installed.packages()[,1] == 'rmarkdown')) suppressWarnings(library(rmarkdown))
+
+my_session_info <- VISCfunctions::get_session_info()
+
+tbl_caption <- "Reproducibility software session information"
+
+if (output_type == 'latex') {
+  
+  # format nicely for PDF with kable and kableExtra
+  my_session_info$platform_table %>%
+    kable(booktabs = TRUE, linesep = "", caption = tbl_caption) %>% 
+    kable_styling() %>%
+    column_spec(1, width = "1in") %>%
+    column_spec(2, width = "5.5in")
+  
+} else {
+  
+  # format nicely for Word with flextable
+  my_session_info$platform_table %>%
+    flextable() %>%
+    set_caption(tbl_caption) %>%
+    set_table_properties(layout = "fixed") %>% # to allow overriding automatic column width
+    flextable::width(1, 1, unit = "in") %>%
+    flextable::width(2, 5.5, unit = "in")
+  
+}
+```
+
+```{r Software-Package-Version-Information, results="asis", warning=kable_warnings}
+
+tbl_caption <- "Reproducibility software package version information"
+
+if (output_type == 'latex') {
+  
+  # format nicely for PDF with kable and kableExtra
+  my_session_info$packages_table %>%
+    kable(booktabs = TRUE, linesep = "", caption = tbl_caption) %>% 
+    kable_styling()
+  
+} else {
+  
+  cat(insert_break())
+  
+  # format nicely for Word with flextable
+  my_session_info$packages_table %>%
+    flextable() %>%
+    set_caption(tbl_caption)
+  
+}
+```
