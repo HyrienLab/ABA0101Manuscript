@@ -18,6 +18,7 @@ library(glue)
 library(ggbeeswarm)
 library(knitr)
 library(ggh4x)
+library(clinPK)
 
 source(find_rstudio_root_file("R/config-setup.R"))
 source(find_rstudio_root_file("R/output-funs.R"))
@@ -162,12 +163,14 @@ pwoh_pkpd_simulx = read_rds(find_rstudio_root_file("PK-modeling/pk-output-data/P
 pwoh_simulx_final =  filter(pwoh_pkpd_simulx, model == "PWOH PKPD 2-cmpt time-dependent mm")
 
 pwh_pkpd_simulx = read_rds(find_rstudio_root_file("PK-modeling/pk-output-data/PWH-simulx-res.rds"))
+pwh_simulx_base =  filter(pwh_pkpd_simulx, model == "PWH PKPD")
 pwh_simulx_covadj =  filter(pwh_pkpd_simulx, model == "PWH PKPD (ADJ)")
 
 ```
 
 ```{r pk-parms}
 
+# PWOH 
 pwoh_pk_parms <- pwoh_pkpd_models %>% 
   filter(model == "PWOH PK 2-cmpt time-dependent mm") %>% 
   select(pop_params) %>% 
@@ -190,19 +193,118 @@ pwoh_pd_parms <- pwoh_pkpd_models %>%
 pwoh_pkpd_parms = bind_rows(pwoh_pk_parms, pwoh_pd_parms) %>%
   left_join(pkpd_parameters_mm, by = "parameter")
 
-pk_parms_table = pwh_pkpd_models %>%
+
+#PWH 
+pwh_pk_parms = pwh_pkpd_models %>%
   filter(model %in% c("PWH PK", "PWH PK (ADJ)")) %>% 
   unnest(pop_params) %>%
   filter(!is.na(rse))
 
-pd_parms_table = pwh_pkpd_models %>% 
+pwh_pd_parms = pwh_pkpd_models %>% 
   filter(model %in% c("PWH PKPD", "PWH PKPD (ADJ)")) %>% 
   unnest(pop_params) %>%
   filter(!is.na(rse))
 
+pwh_pkpd_parms = pwh_pk_parms %>%
+  mutate(
+    parameter = if_else(parameter == "b", "b1", parameter),
+    parameter = if_else(parameter == "Vstart_pop", "Vm_pop", parameter)
+    ) %>%
+  bind_rows(pwh_pd_parms) %>%
+  mutate(
+    model_table = case_when(
+      str_detect(model, "ADJ") ~ "PWH (Covariate-Adjusted)",
+      T ~ "PWH (Base)"
+    ),
+    estimate = stat_paste(value, rse, digits = 2)
+    )
 
 ```
 
+
+```{r half-life-calc}
+
+# this runs a series regression to find shallowest curve (approx HL)
+# dat is the popPK mean curve for a given group
+fit_lm_df = function(dat, day_min = 3, day_max = 28, min_window = 7, lloq_ug = 0.2){
+
+  map_df(day_min:(day_max - min_window), function(dlow){
+   map((dlow+7):day_max, function(dhigh){
+      lm_dat_sub = filter(dat, day >= dlow & day <= dhigh)
+      # lloq creates artificially shallow curves
+      if(any(lm_dat_sub$L == lloq_ug)) return(NULL)
+      tibble(
+        day_start = dlow,
+        day_end = dhigh,
+        mod = list(lm(logL ~ day, data = lm_dat_sub))
+      )
+    }) %>%
+    list_rbind()
+  }) 
+}
+
+approx_hl_setup = bind_rows(pwh_simulx_base, pwh_simulx_covadj, pwoh_simulx_final) %>%
+  mutate(
+    model_table = case_when(
+      str_detect(model, "PWOH") ~ "PWOH",
+      str_detect(model, "ADJ") ~ "PWH (Covariate-Adjusted)",
+      T ~ "PWH (Base)"
+    )
+  ) %>%
+  dplyr::select(model_table, pop_mean_conc) %>%
+  unnest(pop_mean_conc) %>%
+  filter(str_detect(model_table, "PWH") | group %in% c("E", "F")) %>%
+  mutate(L = pmax(L, 0.2), logL = log(L), day = time) %>%
+  group_by(model_table, group, dose) %>%
+  nest() %>%
+  mutate(
+    approx_hl_df = map(data, fit_lm_df)
+  ) 
+
+approx_hl = approx_hl_setup %>%
+  unnest(approx_hl_df) %>%
+  mutate(
+    hl = map_dbl(mod, ~log(0.5)/coef(.)[['day']]),
+    maxhl = hl == max(hl)
+  ) %>%
+  filter(maxhl) %>%
+  mutate(
+    dose_full = paste(dose, "mg/kg"),
+    pred = map(mod, ~(tibble(day = 0:21, 
+                             logL = predict(., newdata = tibble(day = day)),
+                             L = exp(logL)))
+    )
+  ) %>%
+  ungroup() %>%
+  mutate(model_plot = fct_relevel(factor(model_table), "PWOH"))
+
+
+max_hl = bind_rows(mutate(pwoh_pk_parms, model_table = "PWOH"), pwh_pkpd_parms) %>%
+  select(model_table, parameter, value) %>%
+  spread(parameter, value) %>%
+  group_by(model_table) %>%
+  summarize(
+    hl = clinPK::pk_2cmt_t12(CL = Cl_pop, V = V_pop, 
+                             Q = Q_pop, V2 = V2_pop)$beta,
+    .groups = "drop"
+  ) %>%
+  mutate(
+    table_label = "Maximum half-life"
+  )
+
+
+hl_table = approx_hl %>%
+  mutate(
+    table_label = paste("Approx. half-life at",
+                        dose_full)
+    
+  ) %>%
+  select(model_table, table_label, hl) %>%
+  bind_rows(max_hl)
+
+# spread(hl_table, model_table, hl)
+
+```
 
 ```{r make-mean-plots}
 
@@ -306,6 +408,121 @@ This analysis script displays the results of the PKPD modeling of 10e8.4/iMab in
 PKPD modeling was done in Monolix. The raw Monolix project outputs are in `PK-modeling/MLX-projects`. Key output from the modeling has been collated into nested tibble data objects loaded here for figures and tables.
 
 `r insert_break()`
+
+# Manuscript Tables
+
+## Table 2: PK Parm Tables
+
+Manuscript table assembled in two parts
+
+```{r hl-table}
+
+
+hl_table %>%
+  pivot_wider(names_from = "model_table", values_from = "hl") %>%
+  relocate(table_label, PWOH) %>%
+  rename(`HL computation (days)` = table_label) %>%
+    kable(
+      digits = 1,
+      format = output_type,
+      caption = "Half-life calculations",
+      escape = FALSE,
+      booktabs = TRUE
+    ) %>%
+    kable_styling(latex_options = c("scale_down", "HOLD_position"))
+
+```
+
+```{r pk-parms-table}
+
+caption = "PK parm table"
+
+pk_table = pwh_pkpd_parms %>%
+  pivot_wider(id_cols = parameter, values_from = estimate, names_from = model_table) %>%
+  add_row(parameter = "Km_pop", `PWH (Base)` = "0.2", `PWH (Covariate-Adjusted)` = "0.2") %>%
+  add_row(parameter = "omega_EC50", `PWH (Base)` = "", `PWH (Covariate-Adjusted)` = "") %>%
+  mutate(parameter_label = factor(parameter, levels = pkpd_parameters_mm$parameter,
+                                 labels = pkpd_parameters_mm$parameter_label)) %>% 
+  left_join(pkpd_parameters_mm[c("parameter", "parameter_description")], by = "parameter") %>% 
+  full_join(select(pwoh_pkpd_parms, parameter_label, parameter_description, pwoh_estimate), 
+            by = c("parameter_label", "parameter_description")) %>%
+  mutate(parameter_label = factor(parameter_label, levels = pkpd_parameters_mm$parameter_label)) %>%
+  arrange(parameter_label) %>% 
+  select(
+    Parameter = parameter_label,
+    Description = parameter_description,
+    `PWOH` = pwoh_estimate,
+    `PWH (Base)`,
+    `PWH (Covariate-Adjusted)`
+  ) 
+
+if (output_type == 'latex' | interactive()) {
+  pk_table %>% 
+    kable(
+      digits = 2,
+      format = output_type,
+      caption = caption,
+      caption.short = "Final PKPD model parameters.",
+      escape = FALSE,
+      booktabs = TRUE,
+      align = "llrrr"
+    ) %>% 
+    pack_rows("Fixed effects (PK)", 1, 12) %>% 
+    pack_rows("Fixed effects (PD)", 13, 14) %>% 
+    pack_rows("Standard deviations of the random effects", 15, 17) %>% 
+    pack_rows("Error model parameters", 18, 19) %>% 
+    add_header_above(c(" " = 2, "Estimate (\\\\%RSE)" = 3), escape = F) %>%
+    landscape() %>%
+    kable_styling(latex_options = c("scale_down", "HOLD_position"))
+  
+} else{
+  
+    pk_table %>%
+    flextable()%>%
+    set_caption(caption) %>%
+    padding(padding = 0, part = "all") %>% 
+    colformat_double(digits = 2) %>%
+    fontsize(size = 10, part = "all") %>%
+    autofit() 
+  
+}
+
+```
+
+## Supp. Table 1: PWH Covarate Selection
+
+```{r pwh-covariate}
+
+caption <- "Information criteria estimated for the PK models during covariate model building using the SCM algorithm (see Section \\ref{pk-building}). The base model represents the unadjusted PK model. Covariate-adjustments were implemented using a log-linear function with all covariates centered on their median. Adjustments included in the given model are denoted by parameter:covariate. The row for the final model selected (9) was highlighted yellow."
+
+read_csv(find_rstudio_root_file("PK-modeling/pk-output-data/PWH-covariate-SCM-results.csv"), show_col_types = F) %>%
+  mutate(
+    parms = str_replace_all(str_replace_all(parms, ":", ", "), "_", ":"),
+    parms = str_replace_all(parms, "Vstart", "Vm"),
+    parms = str_replace_all(parms, "V:", "Vc:") 
+  ) %>%
+  select(
+    `Model iteration` = run_no,
+    `Covariate-adjustment` = parms,
+    BICc,
+    `-Log likelihood` = loglik
+  ) %>% 
+  kable(
+    digits = 0,
+    format = output_type,
+    caption = caption,
+    caption.short = "Covariate model search results.",
+    escape = FALSE,
+    booktabs = TRUE,
+    align = "llrr"
+  ) %>%
+  row_spec(9, background = "yellow") %>%
+  kable_styling(latex_options = c("HOLD_position"))
+
+```
+
+`r insert_break()`
+
 
 # Manuscript Figures
 
@@ -590,111 +807,6 @@ pwh_indiv_cl %>%
 
 `r insert_break()`
 
-# Manuscript Tables
-
-## Table 2: PK Parm Table
-
-```{r pk-parms-table}
-
-caption = "PK parm table"
-
-pk_table = pk_parms_table %>%
-  mutate(
-    parameter = if_else(parameter == "b", "b1", parameter),
-    parameter = if_else(parameter == "Vstart_pop", "Vm_pop", parameter)
-    ) %>%
-  bind_rows(pd_parms_table) %>%
-  mutate(
-    model_table = case_when(
-      str_detect(model, "ADJ") ~ "PWH (Covariate-Adjusted)",
-      T ~ "PWH (Base)"
-    ),
-    estimate = stat_paste(value, rse, digits = 2)
-    ) %>%
-  pivot_wider(id_cols = parameter, values_from = estimate, names_from = model_table) %>%
-  add_row(parameter = "Km_pop", `PWH (Base)` = "0.2", `PWH (Covariate-Adjusted)` = "0.2") %>%
-  add_row(parameter = "omega_EC50", `PWH (Base)` = "", `PWH (Covariate-Adjusted)` = "") %>%
-  mutate(parameter_label = factor(parameter, levels = pkpd_parameters_mm$parameter,
-                                 labels = pkpd_parameters_mm$parameter_label)) %>% 
-  left_join(pkpd_parameters_mm[c("parameter", "parameter_description")], by = "parameter") %>% 
-  full_join(select(pwoh_pkpd_parms, parameter_label, parameter_description, pwoh_estimate), 
-            by = c("parameter_label", "parameter_description")) %>%
-  mutate(parameter_label = factor(parameter_label, levels = pkpd_parameters_mm$parameter_label)) %>%
-  arrange(parameter_label) %>% 
-  select(
-    Parameter = parameter_label,
-    Description = parameter_description,
-    `PWOH` = pwoh_estimate,
-    `PWH (Base)`,
-    `PWH (Covariate-Adjusted)`
-  ) 
-
-if (output_type == 'latex' | interactive()) {
-  pk_table %>% 
-    kable(
-      digits = 2,
-      format = output_type,
-      caption = caption,
-      caption.short = "Final PKPD model parameters.",
-      escape = FALSE,
-      booktabs = TRUE,
-      align = "llrrr"
-    ) %>% 
-    pack_rows("Fixed effects (PK)", 1, 12) %>% 
-    pack_rows("Fixed effects (PD)", 13, 14) %>% 
-    pack_rows("Standard deviations of the random effects", 15, 17) %>% 
-    pack_rows("Error model parameters", 18, 19) %>% 
-    add_header_above(c(" " = 2, "Estimate (\\\\%RSE)" = 3), escape = F) %>%
-    landscape() %>%
-    kable_styling(latex_options = c("scale_down", "HOLD_position"))
-  
-} else{
-  
-    pk_table %>%
-    flextable()%>%
-    set_caption(caption) %>%
-    padding(padding = 0, part = "all") %>% 
-    colformat_double(digits = 2) %>%
-    fontsize(size = 10, part = "all") %>%
-    autofit() 
-  
-}
-
-```
-
-## Supp. Table 1: PWH Covarate Selection
-
-```{r pwh-covariate}
-
-caption <- "Information criteria estimated for the PK models during covariate model building using the SCM algorithm (see Section \\ref{pk-building}). The base model represents the unadjusted PK model. Covariate-adjustments were implemented using a log-linear function with all covariates centered on their median. Adjustments included in the given model are denoted by parameter:covariate. The row for the final model selected (9) was highlighted yellow."
-
-read_csv(find_rstudio_root_file("PK-modeling/pk-output-data/PWH-covariate-SCM-results.csv"), show_col_types = F) %>%
-  mutate(
-    parms = str_replace_all(str_replace_all(parms, ":", ", "), "_", ":"),
-    parms = str_replace_all(parms, "Vstart", "Vm"),
-    parms = str_replace_all(parms, "V:", "Vc:") 
-  ) %>%
-  select(
-    `Model iteration` = run_no,
-    `Covariate-adjustment` = parms,
-    BICc,
-    `-Log likelihood` = loglik
-  ) %>% 
-  kable(
-    digits = 0,
-    format = output_type,
-    caption = caption,
-    caption.short = "Covariate model search results.",
-    escape = FALSE,
-    booktabs = TRUE,
-    align = "llrr"
-  ) %>%
-  row_spec(9, background = "yellow") %>%
-  kable_styling(latex_options = c("HOLD_position"))
-
-```
-
-`r insert_break()`
 
 # Additional results
 
@@ -722,6 +834,41 @@ pwh_pkpd_models  %>%
   kable(caption = "PWH BICc", digits = 2, booktabs = TRUE) %>%
   kable_styling(latex_options = "HOLD_position")
 
+
+```
+
+## Approx half-life
+
+
+```{r approx-hl-pl, fig.scap = "Approx half-life estimation.", fig.cap = "Estimation. of approximate half-life by finding slowest linear phase (dashed red line) overlaid on serum concentration curve. Population serum concentration curves computed based on the population PK parameters. Approximate half-life computed for high dose groups (10 mg/kg and 30 mg/kg) for each cohort (PWH and PWOH). No covariate-adjusted model was fit for PWOH. Vertical dotted lines indicate range (minimum 1 week) of data where longest half-life estimated."}
+
+approx_hl %>%
+  unnest(data) %>%
+  filter(day < 35) %>%
+  ggplot(aes(x = day, y = L)) +
+  geom_line(linewidth = 1) +
+  geom_line(
+    data = unnest(approx_hl, pred),
+    color = "red",
+    linewidth = 1,
+    linetype = 5
+  ) +
+  geom_vline(aes(xintercept = day_start),  color = "red", linetype = "dotted") +
+  geom_vline(aes(xintercept = day_end),  color = "red", linetype = "dotted") +
+  geom_text(data = mutate(approx_hl, 
+                          yloc = map2_dbl(mod, day_end, ~predict(..1, tibble(day = ..2)))), 
+            aes(label = paste("HL =", round(hl, 1), "days"), 
+                x = day_end, y = exp(yloc)),
+            hjust = 0, vjust = 0) +
+  scale_y_log10(
+    breaks = c(.2, 1, 10, 100, 1000),
+    labels = c(as.expression(bquote("" <= .(
+      0.2
+    ))), 1, 10, 100, 1000),
+    limits = c(0.2, 5000)
+  ) +
+  facet_grid(cols = vars(model_plot), rows = vars(dose_full)) +
+  labs(y = conc_title, x = "Days post-administration")
 
 ```
 
