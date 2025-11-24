@@ -456,9 +456,12 @@ mod_res %>%
 # Reproducibility Software Information
 
 ```{r Software-Session-Information, results="asis", message=FALSE, warning=F}
-library(flextable)
-# load in rmarkdown to capture version number
-if (any(installed.packages()[,1] == 'rmarkdown')) suppressWarnings(library(rmarkdown))
+suppressPackageStartupMessages({
+  library(rmarkdown)
+  library(PK)
+  library(sessioninfo)
+  library(flextable)
+  })
 
 my_session_info <- VISCfunctions::get_session_info()
 

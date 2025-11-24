@@ -8,6 +8,7 @@ output:
 ---
 
 ```{r setup, include=FALSE}
+library(renv)
 library(tidyverse)
 library(kableExtra)
 library(rprojroot)
@@ -611,6 +612,43 @@ cd4_pls[[1]] + cd4_pls[[2]]
 
 ```
 
+```{r cd8-pl, fig.height=6.5, fig.cap = "CD8 levels"}
+cd8_pls = map(c("cd8_pct", "cd8_count"), function(i){
+  ytitle = switch(i, 
+                  cd8_pct  = "CD8 percent",
+                  cd8_count = "CD8 Count (cells/µL)")
+  ylims = switch(i, 
+                  cd8_pct  = c(0, 75),
+                  cd8_count = c(0, 1600))
+  
+  cd4_data$outcome = cd4_data[[i]]
+  cd4_data %>%
+    ggplot(aes(x = study_day, y = outcome)) +
+    geom_point() +
+    geom_line(aes(group = pubid)) +
+    facet_wrap(~group_label, nrow = 5) +
+    scale_y_continuous(limits = ylims) +
+    theme_bw() +
+    labs(x = "Day post-administration", y = ytitle)
+  
+})
+
+cd8_pls[[1]] + cd8_pls[[2]]
+
+
+```
+
+
+```{r all-cds,  fig.height=6.5, fig.cap = "CD4 and CD8 levels"}
+
+cd_pls_list = list(cd4_pls[[1]], cd8_pls[[1]], cd4_pls[[2]], cd8_pls[[2]])
+
+cd_pls_list = map(cd_pls_list, ~(..1 + theme(strip.text = element_text(size = 7))))
+
+patchwork::wrap_plots(cd_pls_list, nrow = 1) + plot_layout(axis_titles = "collect")
+
+```
+
 ## Ext Fig 5: PWOH Simulations
 
 ```{r model-simulations, fig.cap="Simulated 10E8.4/iMab concentration over time (days relative to study administration) from two dosing scenarios: 10 mg/kg SC and 30 mg/kg IV. In both scenarios 3 doses were administered 28 days apart. The solid line is the simulated median concentration and the blue shaded area is the 90\\% prediction interval. The red dashed line represents the LLoQ.", fig.scap="Trial simulations."}
@@ -877,11 +915,15 @@ approx_hl %>%
 # Reproducibility Software Information
 
 ```{r Software-Session-Information, results="asis", message=FALSE, warning=F}
-library(flextable)
-# load in rmarkdown to capture version number
-if (any(installed.packages()[,1] == 'rmarkdown')) suppressWarnings(library(rmarkdown))
 
-my_session_info <- VISCfunctions::get_session_info()
+suppressPackageStartupMessages({
+  library(rmarkdown)
+  library(cowplot)
+  library(sessioninfo)
+  })
+
+
+my_session_info <- get_session_info()
 
 tbl_caption <- "Reproducibility software session information"
 

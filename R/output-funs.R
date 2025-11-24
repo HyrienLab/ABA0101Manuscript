@@ -1,3 +1,5 @@
+# the following functions are fairly generic to clean output
+# none are critical to the analysis
 
 paste_median_minmax <- function(var, digits = 2) {
   
@@ -14,11 +16,6 @@ paste_range = function(x, collapse = " - ", digits = 2) paste(round(x, digits = 
 paste_list = function(x, digits = 1){
   paste0(round(x, digits), c( rep(", ", length(x) - 2), ", and ", ""), collapse = "")
 }
-
-split_group_label = function(x) str_replace(str_replace(x, ": ", "\n"), "kg ", "kg\n")
-
-conc_title = bquote("10E8.4/iMab Concentration ("*mu*"g/mL)")
-vl_title = expression(paste("Log"[10], " viral load (copies/mL)"))
 
 # the following functions come from github: FredHutch/VISCfunctions
 # remotes::install_github("FredHutch/VISCfunctions") to install and check help documentation
@@ -130,3 +127,64 @@ insert_break = function() {
   ifelse(knitr::opts_knit$get("rmarkdown.pandoc.to") == "latex", 
          "\\clearpage", "\\newpage")
 }
+
+get_session_info = function (libpath = FALSE) {
+
+  my_session_info <- sessioninfo::session_info()
+  platform <- my_session_info[[1]]
+  packages <- my_session_info[[2]]
+  my_session_info1 <- data.frame(name = names(platform), value = matrix(unlist(platform), 
+                                                                        nrow = length(platform)), stringsAsFactors = FALSE)
+  my_current_input <- ifelse(is.null(ci <- knitr::current_input()), 
+                             "No Input File Detected", ci)
+  my_current_input_w_dir <- ifelse(is.null(ci <- knitr::current_input(dir = TRUE)), 
+                                   "No Input File Detected", ci)
+  file_name <- data.frame(name = "file name", value = my_current_input, 
+                          stringsAsFactors = FALSE)
+  gitremoteorg <- tryCatch(system2("git", "remote -v", stdout = TRUE, 
+                                   stderr = FALSE)[1], error = function(c) "", warning = function(c) "")
+  gitremote <- substr(gitremoteorg, regexpr("\t", gitremoteorg) + 
+                        1, regexpr(" \\(", gitremoteorg) - 1)
+  if (is.na(gitremote) || gitremote == "" || grepl("fatal", 
+                                                   gitremote)) {
+    folder_info <- data.frame(name = "location", value = ifelse(my_current_input_w_dir != 
+                                                                  "No Input File Detected", dirname(my_current_input_w_dir), 
+                                                                getwd()), stringsAsFactors = FALSE)
+    my_session_info1 <- rbind(my_session_info1, folder_info, 
+                              file_name)
+  }
+  else {
+    if (my_current_input_w_dir != "No Input File Detected") {
+      all_git_files <- system2("git", "ls-files -co --no-empty-directory --full-name", 
+                               stdout = TRUE, stderr = FALSE)
+      folder_info_in <- dirname(all_git_files[unlist(lapply(all_git_files, 
+                                                            function(xx) grepl(xx, my_current_input_w_dir)))])
+    }
+    else {
+      folder_info_in <- "No Input File Location Detected"
+    }
+    folder_info <- data.frame(name = "location", value = folder_info_in, 
+                              stringsAsFactors = FALSE)
+    url_info <- data.frame(name = "repo", value = gitremote, 
+                           stringsAsFactors = FALSE)
+    my_session_info1 <- rbind(my_session_info1, url_info, 
+                              file_name, folder_info)
+  }
+  my_session_info2 <- packages[packages$attached, ]
+  my_session_info2 <- with(my_session_info2, {
+    data.frame(package = package, version = loadedversion, 
+               data.version = purrr::map_chr(package, utils::packageDescription, 
+                                             fields = "DataVersion"), date = date, source = source, 
+               libpath = library)
+  })
+  if (!libpath) 
+    my_session_info2$libpath <- NULL
+  if (any(!is.na(my_session_info2$data.version))) 
+    my_session_info2$data.version[is.na(my_session_info2$data.version)] <- ""
+  else my_session_info2 <- my_session_info2[, -match("data.version", 
+                                                     colnames(my_session_info2))]
+  list(platform_table = my_session_info1, packages_table = my_session_info2)
+}
+
+
+

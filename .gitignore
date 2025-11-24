@@ -26,3 +26,4 @@ Thumbs.db
 data-raw/*.html
 *_cache/
 .smbdelete*
+local_**

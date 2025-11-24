@@ -1,3 +1,9 @@
+# the following functions/objects help map group names, colors, and parameter names specific the ABA0101 analysis
+
+split_group_label = function(x) str_replace(str_replace(x, ": ", "\n"), "kg ", "kg\n")
+
+conc_title = bquote("10E8.4/iMab Concentration ("*mu*"g/mL)")
+vl_title = expression(paste("Log"[10], " viral load (copies/mL)"))
 
 simplify_group_label = function(full_group_label){
   full_group_label |>
@@ -53,3 +59,5 @@ pkpd_parameters_mm <- tribble(
   "b1", "$\\sigma_{concentration}$ (proportional)", "Model SE",
   "b2", "$\\sigma_{CD4RO}$ (proportional)", "Model SE"
 )
+
+
