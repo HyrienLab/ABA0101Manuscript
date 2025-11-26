@@ -463,7 +463,7 @@ suppressPackageStartupMessages({
   library(flextable)
   })
 
-my_session_info <- VISCfunctions::get_session_info()
+my_session_info <- get_session_info()
 
 tbl_caption <- "Reproducibility software session information"
 
